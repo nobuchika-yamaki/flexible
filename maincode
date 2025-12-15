@@ -1,0 +1,195 @@
+"""
+Flexible Control Framework — core Methods implementation
+
+Implements:
+- Nonlinear redundant task mapping y(x)
+- Jacobian J(x) and null-space projector P_null(x)
+- Stochastic state update with fixed feedback gain
+- Learning-driven covariance reorganization (phenomenological rule)
+- Sliding-window state covariance Σ(t)
+- CAC(t) = tr(P_null Σ P_null)
+- Task sensitivity ‖J‖_F
+- Trial-wise correlations (CAC–error, CAC–sensitivity)
+"""
+
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+
+
+@dataclass
+class FCFParams:
+    T: int = 400                 # time steps per trial
+    alpha: float = 0.3           # curvature parameter (task nonlinearity)
+    k: float = 0.08              # fixed feedback gain
+    eta: float = 0.02            # learning rate for covariance reorganization
+    sigma0: float = 0.4          # initial isotropic noise covariance scale
+    window: int = 40             # sliding window length for Σ(t)
+    seed: Optional[int] = 42     # reproducibility
+
+
+def task_output(x: np.ndarray, alpha: float) -> np.ndarray:
+    """y(x): nonlinear redundant mapping R^3 -> R^2"""
+    x1, x2, x3 = x
+    y1 = x1 + x2 + alpha * (x1 + x2) * x3
+    y2 = x3
+    return np.array([y1, y2], dtype=float)
+
+
+def jacobian(x: np.ndarray, alpha: float) -> np.ndarray:
+    """J(x): 2x3 Jacobian of y(x)"""
+    x1, x2, x3 = x
+    j11 = 1.0 + alpha * x3
+    j12 = 1.0 + alpha * x3
+    j13 = alpha * (x1 + x2)
+    return np.array([[j11, j12, j13],
+                     [0.0, 0.0, 1.0]], dtype=float)
+
+
+def p_null(J: np.ndarray, rcond: float = 1e-12) -> np.ndarray:
+    """
+    P_null = I - J^T (J J^T)^(-1) J
+    Uses pseudo-inverse for numerical stability.
+    """
+    I = np.eye(J.shape[1], dtype=float)  # 3x3
+    JJt = J @ J.T                        # 2x2
+    JJt_inv = np.linalg.pinv(JJt, rcond=rcond)
+    return I - J.T @ JJt_inv @ J
+
+
+def frob_norm(A: np.ndarray) -> float:
+    return float(np.linalg.norm(A, ord="fro"))
+
+
+def sliding_cov(history: np.ndarray) -> np.ndarray:
+    """
+    history: (W, 3) matrix of recent states.
+    Returns 3x3 sample covariance.
+    """
+    # rowvar=False => variables are columns
+    return np.cov(history, rowvar=False, bias=False)
+
+
+def simulate_trial(params: FCFParams) -> Dict[str, np.ndarray]:
+    rng = np.random.default_rng(params.seed)
+
+    # Initialize
+    x = rng.normal(0.0, 0.1, size=3)
+    Sigma_noise = params.sigma0 * np.eye(3, dtype=float)
+
+    xs = np.zeros((params.T, 3), dtype=float)
+    ys = np.zeros((params.T, 2), dtype=float)
+    error = np.zeros(params.T, dtype=float)
+    cac = np.full(params.T, np.nan, dtype=float)
+    jnorm = np.zeros(params.T, dtype=float)
+
+    # state history buffer for sliding covariance
+    buf = np.zeros((params.window, 3), dtype=float)
+    buf_filled = 0
+
+    for t in range(params.T):
+        # Outputs & Jacobian
+        y = task_output(x, params.alpha)
+        J = jacobian(x, params.alpha)
+        Pn = p_null(J)
+
+        ys[t] = y
+        xs[t] = x
+        error[t] = float(np.linalg.norm(y))
+        jnorm[t] = frob_norm(J)
+
+        # Update sliding buffer
+        if buf_filled < params.window:
+            buf[buf_filled] = x
+            buf_filled += 1
+        else:
+            buf[:-1] = buf[1:]
+            buf[-1] = x
+
+        # Compute CAC if window available
+        if buf_filled >= params.window:
+            Sigma_state = sliding_cov(buf)
+            cac[t] = float(np.trace(Pn @ Sigma_state @ Pn))
+
+        # Fixed-gain feedback control
+        u = -params.k * (J.T @ y)  # 3-vector
+
+        # Sample intrinsic noise with current covariance
+        # (ensure symmetry)
+        Sigma_noise = 0.5 * (Sigma_noise + Sigma_noise.T)
+        noise = rng.multivariate_normal(mean=np.zeros(3), cov=Sigma_noise)
+
+        # State update
+        x = x + u + noise
+
+        # Learning-driven covariance reorganization (phenomenological)
+        JJ = J.T @ J  # 3x3
+        Sigma_noise = Sigma_noise - params.eta * (JJ @ Sigma_noise) + params.eta * (Pn @ Sigma_noise)
+
+    return {
+        "x": xs,
+        "y": ys,
+        "error": error,
+        "cac": cac,
+        "jnorm": jnorm,
+    }
+
+
+def simulate_many(params: FCFParams, n_trials: int = 200, seed0: int = 123) -> Dict[str, np.ndarray]:
+    """
+    Run multiple independent trials (noise realizations / initial conditions).
+    Returns arrays of trial-wise correlations:
+    - corr_cac_error: corr(CAC(t), error(t)) within each trial
+    - corr_cac_jnorm: corr(CAC(t), ‖J‖_F(t)) within each trial
+    """
+    corr_cac_error = []
+    corr_cac_jnorm = []
+
+    for i in range(n_trials):
+        p = FCFParams(**{**params.__dict__})
+        p.seed = seed0 + i
+
+        out = simulate_trial(p)
+        cac = out["cac"]
+        err = out["error"]
+        jn = out["jnorm"]
+
+        valid = ~np.isnan(cac)
+        if valid.sum() < 5:
+            continue
+
+        # Pearson correlations within trial
+        corr_cac_error.append(np.corrcoef(cac[valid], err[valid])[0, 1])
+        corr_cac_jnorm.append(np.corrcoef(cac[valid], jn[valid])[0, 1])
+
+    return {
+        "corr_cac_error": np.array(corr_cac_error, dtype=float),
+        "corr_cac_jnorm": np.array(corr_cac_jnorm, dtype=float),
+    }
+
+
+def summary_stats(arr: np.ndarray) -> Tuple[float, float]:
+    """mean ± std"""
+    return float(np.mean(arr)), float(np.std(arr))
+
+
+if __name__ == "__main__":
+    params = FCFParams(
+        T=400,
+        alpha=0.3,
+        k=0.08,
+        eta=0.02,
+        sigma0=0.4,
+        window=40,
+        seed=42,
+    )
+
+    out1 = simulate_trial(params)
+    print("Single trial (last 5 valid CAC):", out1["cac"][~np.isnan(out1["cac"])][-5:])
+
+    trials = simulate_many(params, n_trials=200, seed0=1000)
+    m1, s1 = summary_stats(trials["corr_cac_error"])
+    m2, s2 = summary_stats(trials["corr_cac_jnorm"])
+    print(f"Trial-wise corr(CAC, error): mean={m1:.3f}, std={s1:.3f}")
+    print(f"Trial-wise corr(CAC, ‖J‖F): mean={m2:.3f}, std={s2:.3f}")
