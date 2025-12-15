@@ -1,0 +1,11 @@
+# Optional: PSD-preserving covariance update (Supplement candidate)
+# Projects Σ_noise onto PSD cone by eigenvalue clipping after each update.
+
+def project_to_psd(S: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    S = 0.5 * (S + S.T)
+    w, V = np.linalg.eigh(S)
+    w = np.maximum(w, eps)
+    return (V * w) @ V.T
+
+# In simulate_trial(), after updating Sigma_noise, add:
+# Sigma_noise = project_to_psd(Sigma_noise)
